@@ -6,9 +6,12 @@ class MonitorSinais: NSObject, ObservableObject, HKWorkoutSessionDelegate, HKLiv
     private let healthStore = HKHealthStore()
     private var session: HKWorkoutSession?
     private var builder: HKLiveWorkoutBuilder?
+    private var timerPolling: Timer?
 
     @Published var bpm: Double = 0
     @Published var spo2: Double = 0
+    @Published var hrv: Double = 0
+    @Published var freqRespiratoria: Double = 0
     @Published var ativo: Bool = false
     @Published var status: String = "Iniciando..."
 
@@ -24,7 +27,9 @@ class MonitorSinais: NSObject, ObservableObject, HKWorkoutSessionDelegate, HKLiv
 
         let tiposLeitura: Set<HKObjectType> = [
             HKObjectType.quantityType(forIdentifier: .heartRate)!,
-            HKObjectType.quantityType(forIdentifier: .oxygenSaturation)!
+            HKObjectType.quantityType(forIdentifier: .oxygenSaturation)!,
+            HKObjectType.quantityType(forIdentifier: .heartRateVariabilitySDNN)!,
+            HKObjectType.quantityType(forIdentifier: .respiratoryRate)!,
         ]
         let tiposCompartilhar: Set<HKSampleType> = [HKObjectType.workoutType()]
 
@@ -43,10 +48,11 @@ class MonitorSinais: NSObject, ObservableObject, HKWorkoutSessionDelegate, HKLiv
 
             self.session?.delegate = self
             self.builder?.delegate = self
-            self.builder?.dataSource = HKLiveWorkoutDataSource(
+            let dataSource = HKLiveWorkoutDataSource(
                 healthStore: self.healthStore,
                 workoutConfiguration: config
             )
+            self.builder?.dataSource = dataSource
 
             let inicio = Date()
             self.session?.startActivity(with: inicio)
@@ -55,6 +61,7 @@ class MonitorSinais: NSObject, ObservableObject, HKWorkoutSessionDelegate, HKLiv
                     if success {
                         self.ativo = true
                         self.status = "Monitorando..."
+                        self.iniciarPolling()
                     } else {
                         self.status = "Erro: \(error?.localizedDescription ?? "desconhecido")"
                     }
@@ -63,7 +70,43 @@ class MonitorSinais: NSObject, ObservableObject, HKWorkoutSessionDelegate, HKLiv
         }
     }
 
+    // Polling para SpO2, HRV e Respiração (não são em tempo real no Watch)
+    private func iniciarPolling() {
+        timerPolling = Timer.scheduledTimer(withTimeInterval: 15.0, repeats: true) { _ in
+            self.lerUltimoValor(identificador: .oxygenSaturation, unidade: HKUnit.percent()) { v in
+                let pct = v * 100
+                if pct > 0 { self.spo2 = pct }
+            }
+            self.lerUltimoValor(identificador: .heartRateVariabilitySDNN, unidade: .secondUnit(with: .milli)) { v in
+                if v > 0 { self.hrv = v }
+            }
+            self.lerUltimoValor(identificador: .respiratoryRate, unidade: HKUnit(from: "count/min")) { v in
+                if v > 0 { self.freqRespiratoria = v }
+            }
+        }
+        timerPolling?.fire() // busca imediatamente na abertura
+    }
+
+    private func lerUltimoValor(identificador: HKQuantityTypeIdentifier,
+                                 unidade: HKUnit,
+                                 completion: @escaping (Double) -> Void) {
+        guard let tipo = HKQuantityType.quantityType(forIdentifier: identificador) else { return }
+        let query = HKSampleQuery(
+            sampleType: tipo,
+            predicate: nil,
+            limit: 1,
+            sortDescriptors: [NSSortDescriptor(key: HKSampleSortIdentifierEndDate, ascending: false)]
+        ) { _, amostras, _ in
+            guard let amostra = amostras?.first as? HKQuantitySample else { return }
+            let valor = amostra.quantity.doubleValue(for: unidade)
+            DispatchQueue.main.async { completion(valor) }
+        }
+        healthStore.execute(query)
+    }
+
     func parar() {
+        timerPolling?.invalidate()
+        timerPolling = nil
         session?.end()
         builder?.endCollection(withEnd: Date()) { _, _ in
             self.builder?.finishWorkout { _, _ in }
@@ -97,11 +140,8 @@ class MonitorSinais: NSObject, ObservableObject, HKWorkoutSessionDelegate, HKLiv
                     let valor = stats.mostRecentQuantity()?.doubleValue(for: HKUnit(from: "count/min")) ?? 0
                     if valor > 0 {
                         self.bpm = valor
-                        self.enviarParaInflux(bpm: self.bpm, spo2: self.spo2)
+                        self.enviarParaInflux()
                     }
-                case HKQuantityType.quantityType(forIdentifier: .oxygenSaturation)!:
-                    let valor = (stats.mostRecentQuantity()?.doubleValue(for: .percent()) ?? 0) * 100
-                    if valor > 0 { self.spo2 = valor }
                 default:
                     break
                 }
@@ -109,9 +149,12 @@ class MonitorSinais: NSObject, ObservableObject, HKWorkoutSessionDelegate, HKLiv
         }
     }
 
-    private func enviarParaInflux(bpm: Double, spo2: Double) {
+    private func enviarParaInflux() {
         let timestamp = Int(Date().timeIntervalSince1970 * 1_000_000_000)
-        let line = "sinais_vitais,paciente_id=WATCH,fonte=applewatch bpm=\(bpm),spo2=\(spo2) \(timestamp)"
+        var campos = "bpm=\(bpm),spo2=\(spo2)"
+        if hrv > 0              { campos += ",hrv=\(hrv)" }
+        if freqRespiratoria > 0 { campos += ",freq_respiratoria=\(freqRespiratoria)" }
+        let line = "sinais_vitais,paciente_id=WATCH,fonte=applewatch \(campos) \(timestamp)"
 
         guard let url = URL(string: "\(influxURL)/api/v2/write?org=\(influxOrg)&bucket=\(influxBucket)&precision=ns") else { return }
 
